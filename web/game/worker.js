@@ -146,7 +146,7 @@ const bc = self.bc = {
 
 async function start(m) {
   io = new Worker('io.js');
-  await new Promise(r => { io.onmessage = e => { if (e.data.ready) r(); else if (e.data.log) console.log(e.data.log); else if (e.data.progress || e.data.shot) postMessage(e.data, e.data.shot ? [e.data.data.buffer] : []); }; io.postMessage({ init: true, sab, manifest: m.manifest || '/data/manifest.json', base: m.base || '/data/' }); });
+  await new Promise(r => { io.onmessage = e => { if (e.data.ready) r(); else if (e.data.fatal) postMessage({ status: 'crash', error: e.data.fatal }); else if (e.data.log) console.log(e.data.log); else if (e.data.progress || e.data.shot) postMessage(e.data, e.data.shot ? [e.data.data.buffer] : []); }; io.postMessage({ init: true, sab, manifest: m.manifest || '/data/manifest.json', base: m.base || '/data/' }); });
   bc.args = m.args || [];
   let G = null;
   if (!m.server) {

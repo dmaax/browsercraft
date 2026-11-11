@@ -209,9 +209,17 @@ onmessage = async (ev) => {
     root = await navigator.storage.getDirectory();
     if (m.manifest) {
       base = m.base || base;
-      const j = await (await fetch(m.manifest)).json();
-      for (const [k, v] of Object.entries(j.files)) { man.set(k, v); addDir(k); }
-      if (j.jar) await openJar(j.jar);
+      try {
+        const r = await fetch(m.manifest);
+        // Without a session the server answers 401 here; say so instead of hanging the boot forever.
+        if (!r.ok) throw new Error(`${m.manifest}: HTTP ${r.status}${r.status === 401 ? ' (not logged in)' : ''}`);
+        const j = await r.json();
+        for (const [k, v] of Object.entries(j.files)) { man.set(k, v); addDir(k); }
+        if (j.jar) await openJar(j.jar);
+      } catch (e) {
+        postMessage({ fatal: 'loading game files failed: ' + (e && e.message || e) });
+        return;
+      }
     }
     ctl = new Int32Array(m.sab, 0, 4);
     data = new Uint8Array(m.sab, 16);
