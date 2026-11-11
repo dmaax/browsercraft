@@ -14,7 +14,9 @@ const STATE = process.env.BC_STATE || path.resolve('state');
 const PORT = +(process.env.PORT || 8090);
 const CLIENT_ID = process.env.MS_CLIENT_ID || '';
 const ADMINS = (process.env.ADMIN_UUIDS || '').split(',').map(s => s.trim().replace(/-/g, '')).filter(Boolean);
-const PORTS = (process.env.MC_PORTS || '25565-25580').split('-').map(Number);
+// Ports the /ws bridge may dial. Wide by default: the bridge only relays traffic that is Minecraft in
+// both directions (see relay()), so the port range is not what keeps it from being an open relay.
+const PORTS = (process.env.MC_PORTS || '1024-65535').split('-').map(Number);
 const DEV = process.env.BC_DEV === '1';
 const PROXY_HOSTS = new Set(['discovery.minecraftservices.com', 'sessionserver.mojang.com', 'api.minecraftservices.com', 'textures.minecraft.net', 'api.mojang.com', 'authserver.mojang.com', 'pc.realms.minecraft.net', 'resources.download.minecraft.net']);
 
@@ -297,21 +299,192 @@ function sameOrigin(req) {
   try { const h = new URL(o).host; return h === req.headers.host || ORIGINS.has(o); } catch { return false; }
 }
 
+// Resolves where a /ws connection may go. Returns { host, port, addrs } or { error } with a reason
+// that is shown to the player inside the game.
 async function target(host, port) {
-  if (!HOST_RE.test(host)) return null;
+  if (!HOST_RE.test(host)) return { error: 'invalid server address' };
   if (port === 25565) {
     try {
       const r = await dns.resolveSrv('_minecraft._tcp.' + host);
       if (r.length) { host = r[0].name.toLowerCase().replace(/\.$/, ''); port = r[0].port; }
     } catch {}
-    if (!HOST_RE.test(host)) return null;
+    if (!HOST_RE.test(host)) return { error: 'invalid SRV record target' };
   }
-  if (!Number.isInteger(port) || port < PORTS[0] || port > (PORTS[1] || PORTS[0])) return null;
+  if (!Number.isInteger(port) || port < PORTS[0] || port > (PORTS[1] || PORTS[0])) return { error: `port ${port} is not allowed by this bridge (MC_PORTS ${PORTS.join('-')})`, host, port };
   let addrs;
-  try { addrs = await dns.lookup(host, { all: true }); } catch { return null; }
-  if (!addrs.length) return null;
-  if (!ALLOW_PRIVATE && addrs.some(a => blocked.check(a.address, a.family === 6 ? 'ipv6' : 'ipv4'))) return null;
+  try { addrs = await dns.lookup(host, { all: true }); } catch { return { error: `cannot resolve ${host}`, host, port }; }
+  if (!addrs.length) return { error: `cannot resolve ${host}`, host, port };
+  if (!ALLOW_PRIVATE && addrs.some(a => blocked.check(a.address, a.family === 6 ? 'ipv6' : 'ipv4'))) return { error: `${host} is a private address`, host, port };
   return { host, port, addrs };
+}
+
+// --- Just enough of the Minecraft protocol framing for the bridge ------------------------------
+// The bridge only relays connections that look like Minecraft in both directions: the client's
+// first two packets must be a handshake plus a Status Request or Login Start, and the server's
+// first reply must be a valid status response or login packet. Nothing else the client sends is
+// passed on before that, so the bridge cannot be used to talk to SMTP, SSH, HTTP and the like,
+// which is what makes a wide MC_PORTS range acceptable.
+function rv(b, o) { // VarInt at o -> [value, next]; [-1] = need more bytes, [-2] = malformed
+  let n = 0;
+  for (let i = 0; i < 5; i++) {
+    if (o + i >= b.length) return [-1, o];
+    const x = b[o + i];
+    n |= (x & 0x7f) << (7 * i);
+    if (!(x & 0x80)) return [n >>> 0, o + i + 1];
+  }
+  return [-2, o];
+}
+const wv = (n) => { const o = []; n >>>= 0; do { const x = n & 0x7f; n >>>= 7; o.push(x | (n ? 0x80 : 0)); } while (n); return Buffer.from(o); };
+const wstr = (s) => { const b = Buffer.from(s, 'utf8'); return Buffer.concat([wv(b.length), b]); };
+const pkt = (id, ...parts) => { const body = Buffer.concat([wv(id), ...parts]); return Buffer.concat([wv(body.length), body]); };
+
+// One uncompressed packet at the start of b: { need } | { bad } | { id, body, size }
+function frame(b, max) {
+  const [len, o] = rv(b, 0);
+  if (len === -1) return { need: true };
+  if (len < 1 || len > max) return { bad: true };
+  if (b.length < o + len) return { need: true };
+  const [id, p] = rv(b, o);
+  if (id < 0 || p > o + len) return { bad: true };
+  return { id, body: b.subarray(p, o + len), size: o + len };
+}
+
+// Length and packet id as soon as they have arrived, to reject non-Minecraft peers on their first bytes.
+function peek(b) {
+  const [len, o] = rv(b, 0);
+  if (len < 0) return null;
+  const [id] = rv(b, o);
+  return id < 0 ? null : { len, id };
+}
+
+function handshake(f) {
+  if (f.id !== 0) return null;
+  const b = f.body;
+  const [proto, o1] = rv(b, 0);
+  const [sl, o2] = proto < 0 ? [-2, 0] : rv(b, o1);
+  if (sl < 0 || sl > 1024 || o2 + sl + 2 >= b.length) return null;
+  const [next, end] = rv(b, o2 + sl + 2);
+  if (end !== b.length || next < 1 || next > 3) return null;
+  return { proto, address: b.toString('utf8', o2, o2 + sl), next };
+}
+
+// Second client packet: Status Request (empty) for status, Login Start (name + UUID) otherwise.
+const okRequest = (hs, f) => f.id === 0 && (hs.next === 1 ? f.body.length === 0 : f.body.length >= 17 && f.body.length <= 120);
+
+// First server packet: a JSON status response, or one of the clientbound login packets
+// (disconnect, encryption request, login success, set compression, plugin/cookie request).
+function okReply(hs, f) {
+  if (hs.next !== 1) return f.id <= 5;
+  if (f.id !== 0) return false;
+  const [n, o] = rv(f.body, 0);
+  return n > 0 && f.body[o] === 0x7b; // '{'
+}
+
+const CLIENT_WAIT = 10000, SERVER_WAIT = 20000;
+
+// Relays one /ws connection, or answers it in-game with `refusal` when the target is not allowed.
+function relay(ws, tg, refusal) {
+  const t0 = Date.now(), tag = tg.addrs ? `${tg.host}:${tg.port}` : tg.host ? `${tg.host}:${tg.port}` : '?';
+  let phase = 'client', cbuf = Buffer.alloc(0), sbuf = Buffer.alloc(0), hs = null, sock = null, up = 0, down = 0, closed = false, why = refusal;
+  let timer = setTimeout(timeout, CLIENT_WAIT);
+
+  function stop(reason) {
+    if (closed) return;
+    closed = true;
+    clearTimeout(timer);
+    alog(`WS closed ${tag} after ${((Date.now() - t0) / 1000).toFixed(1)}s, client->server ${up} B, server->client ${down} B: ${reason}`);
+    try { ws.close(); } catch {}
+    if (sock) sock.destroy();
+  }
+  function timeout() {
+    if (phase === 'client') stop('no Minecraft handshake from the client');
+    else if (phase === 'connecting') refuse(`timed out connecting to ${tag}`);
+    else if (phase === 'server') refuse(`${tag} did not answer like a Minecraft server`);
+    else stop('timeout');
+  }
+  // Answer in the Minecraft protocol so the player sees the reason: a red MOTD in the server
+  // list (status) or a disconnect screen (login).
+  function refuse(reason) {
+    if (closed) return;
+    if (ws.readyState !== 1) return stop(reason);
+    why = reason;
+    phase = 'refuse';
+    if (sock) { sock.destroy(); sock = null; }
+    clearTimeout(timer);
+    timer = setTimeout(() => stop('refused: ' + why), 5000);
+    alog(`WS refused in-game ${tag}: ${why}`);
+    const text = { text: 'Browsercraft: ' + why, color: 'red' };
+    if (hs.next === 1) {
+      ws.send(pkt(0, wstr(JSON.stringify({ version: { name: 'Browsercraft bridge', protocol: hs.proto }, players: { max: 0, online: 0 }, description: text }))));
+      answerPing();
+    } else {
+      ws.send(pkt(0, wstr(JSON.stringify(text))));
+      setTimeout(() => stop('refused: ' + why), 500);
+    }
+  }
+  function answerPing() {
+    const f = frame(cbuf, 64);
+    if (f.need) return;
+    if (f.bad || f.id !== 1) return stop('refused: ' + why);
+    ws.send(pkt(1, f.body));
+    setTimeout(() => stop('refused: ' + why), 200);
+  }
+  function fromClient() {
+    const pk = peek(cbuf);
+    if (pk && (pk.id !== 0 || pk.len < 1 || pk.len > 1100)) return stop('not a Minecraft handshake');
+    const f1 = frame(cbuf, 1100);
+    if (f1.need) return cbuf.length > 2048 ? stop('handshake too long') : undefined;
+    const h = f1.bad ? null : handshake(f1);
+    if (!h) return stop('not a Minecraft handshake');
+    const f2 = frame(cbuf.subarray(f1.size), 200);
+    if (f2.need) return;
+    if (f2.bad || !okRequest(h, f2)) return stop('not a Minecraft status/login request');
+    hs = h;
+    const first = cbuf.subarray(0, f1.size + f2.size);
+    cbuf = cbuf.subarray(f1.size + f2.size); // anything else waits until the server is verified
+    if (why) return refuse(why);
+    phase = 'connecting';
+    clearTimeout(timer);
+    timer = setTimeout(timeout, SERVER_WAIT);
+    // Dial the addresses that were checked instead of resolving the name again: a second DNS
+    // answer could point somewhere else. net.connect still tries each address in turn.
+    const lookup = (_h, o, cb) => (o && o.all ? cb(null, tg.addrs) : cb(null, tg.addrs[0].address, tg.addrs[0].family));
+    sock = net.connect({ host: tg.host, port: tg.port, lookup });
+    sock.setNoDelay(true);
+    sock.on('connect', () => { phase = 'server'; alog(`WS tcp connected ${tag} (${['', 'status', 'login', 'transfer'][hs.next]})`); sock.write(first); });
+    sock.on('data', fromServer);
+    sock.on('error', (e) => { if (phase === 'connecting') refuse(`cannot reach ${tag} (${e.code || e.message})`); else if (phase !== 'refuse') stop(`tcp error ${e.code || e.message}`); });
+    sock.on('close', () => { if (phase === 'open') stop('server closed'); else if (phase === 'server') refuse(`${tag} closed the connection without answering`); });
+  }
+  function fromServer(d) {
+    down += d.length;
+    if (phase === 'open') { if (ws.readyState === 1) ws.send(d); return; }
+    if (phase !== 'server') return;
+    sbuf = Buffer.concat([sbuf, d]);
+    const pk = peek(sbuf);
+    if (pk && (pk.len < 1 || pk.len > 1 << 21 || (hs.next === 1 ? pk.id !== 0 : pk.id > 5))) return refuse(`${tag} is not a Minecraft server`);
+    const f = frame(sbuf, 1 << 21);
+    if (f.need) return;
+    if (f.bad || !okReply(hs, f)) return refuse(`${tag} is not a Minecraft server`);
+    phase = 'open';
+    clearTimeout(timer);
+    alog(`WS open ${tag}: verified Minecraft ${hs.next === 1 ? 'status' : 'login'} reply`);
+    ws.send(sbuf);
+    sbuf = null;
+    if (cbuf.length) sock.write(cbuf);
+    cbuf = null;
+  }
+
+  ws.on('message', (d) => {
+    up += d.length;
+    if (phase === 'open') return sock.write(d);
+    cbuf = Buffer.concat([cbuf, d]);
+    if (cbuf.length > 1 << 16) return stop('client sent too much before the server answered');
+    if (phase === 'client') fromClient();
+    else if (phase === 'refuse' && hs.next === 1) answerPing();
+  });
+  ws.on('close', () => stop('client closed'));
+  ws.on('error', () => stop('client error'));
 }
 
 const wss = new WebSocketServer({ noServer: true, maxPayload: 8 << 20 });
@@ -324,36 +497,13 @@ server.on('upgrade', async (req, sock, head) => {
     if (why) { alog('WS refused:', why); sock.destroy(); return; }
     const h = String(u.searchParams.get('h') || '').toLowerCase(), p = +u.searchParams.get('p') || 25565;
     const tg = await target(h, p);
-    if (!tg) { alog(`WS refused: target ${h}:${p} (bad name, port outside MC_PORTS, unresolvable or private)`); sock.destroy(); return; }
-    alog(`WS open -> ${h}:${p}` + (tg.host !== h || tg.port !== p ? ` (SRV ${tg.host}:${tg.port})` : ''));
-    bridge(req, sock, head, tg);
+    if (tg.error) alog(`WS will refuse ${h}:${p}: ${tg.error}`);
+    else alog(`WS accepted -> ${h}:${p}` + (tg.host !== h || tg.port !== p ? ` (SRV ${tg.host}:${tg.port})` : ''));
+    wss.handleUpgrade(req, sock, head, (ws) => relay(ws, tg, tg.error || null));
   } catch (e) {
     console.error(e);
     sock.destroy();
   }
 });
-
-function bridge(req, sock, head, { host, port, addrs }) {
-  wss.handleUpgrade(req, sock, head, (ws) => {
-    // Hand net.connect the addresses that were checked instead of letting it resolve the name
-    // again (a second DNS answer could point somewhere else); it still tries each in turn.
-    const lookup = (_h, o, cb) => (o && o.all ? cb(null, addrs) : cb(null, addrs[0].address, addrs[0].family));
-    const t = net.connect({ host, port, lookup });
-    t.setNoDelay(true);
-    let open = false, up = 0, down = 0, closed = false;
-    const t0 = Date.now(), q = [];
-    t.on('connect', () => { open = true; alog(`WS tcp connected ${host}:${port}`); for (const b of q) t.write(b); q.length = 0; });
-    ws.on('message', (d) => { up += d.length; if (open) t.write(d); else q.push(d); });
-    t.on('data', (d) => { down += d.length; if (ws.readyState === 1) ws.send(d); });
-    const end = () => {
-      if (!closed) { closed = true; alog(`WS closed ${host}:${port} after ${((Date.now() - t0) / 1000).toFixed(1)}s, client->server ${up} B, server->client ${down} B`); }
-      try { ws.close(); } catch {} t.destroy();
-    };
-    t.on('error', (e) => { alog(`WS tcp error ${host}:${port}: ${e.code || e.message}`); end(); });
-    t.on('close', end);
-    ws.on('close', end);
-    ws.on('error', end);
-  });
-}
 
 server.listen(PORT, () => console.log('browsercraft on :' + PORT));
