@@ -1,0 +1,12 @@
+{
+  "name": "browsercraft-e2e",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "gpucheck": "node gpucheck.mjs --enable-features=Vulkan --use-angle=vulkan --ignore-gpu-blocklist",
+    "join": "node join.mjs"
+  },
+  "dependencies": {
+    "puppeteer-core": "24.43.1"
+  }
+}
