@@ -26,3 +26,4 @@ ba.sh
 .DS_Store
 __pycache__/
 scripts/e2e/e2e-out/
+srv/.env
