@@ -185,7 +185,9 @@ onmessage = (e) => {
   if (m.start) {
     if (m.server) { const L = console.log.bind(console); console.log = (...a) => L('[S]', ...a); }
     if (m.win) Object.assign(bc.win, m.win);
-    start(m);
+    // A failure before the game runs (no WebGPU, wasm fetch error...) only reached the worker console,
+    // leaving the launcher on its first loading step forever. Report it as a crash instead.
+    start(m).catch(e => { console.log('CRASH ' + (e && e.stack || e)); postMessage({ status: 'crash', error: String(e && e.message || e) }); });
     return;
   }
   if (m.pipe) { bc.pipe.add(m.port); return; }

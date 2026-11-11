@@ -17,8 +17,10 @@ const FMT = ['r8unorm', 'r8snorm', 'rg8unorm', 'rg8snorm', 'rgba8unorm', 'rgba8s
 function u8() { return new Uint8Array(mem.buffer); }
 
 export async function init(canvas, memory) {
+  const hint = 'Use Chrome or Edge with WebGPU (check chrome://gpu). On Linux enable chrome://flags/#enable-unsafe-webgpu and chrome://flags/#enable-vulkan, then relaunch.';
+  if (!navigator.gpu) throw new Error('WebGPU is not available in this browser. ' + hint);
   const ad = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
-  if (!ad) throw new Error('WebGPU not available');
+  if (!ad) throw new Error('WebGPU found no usable GPU adapter. ' + hint);
   const feats = [];
   for (const f of ['depth32float-stencil8', 'indirect-first-instance', 'texture-compression-bc', 'float32-filterable', 'rg11b10ufloat-renderable']) if (ad.features.has(f)) feats.push(f);
   dev = await ad.requestDevice({
