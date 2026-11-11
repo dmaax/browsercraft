@@ -1,9 +1,18 @@
-import http.server, os, sys, urllib.request, threading
+import http.server, os, posixpath, re, sys, urllib.parse, urllib.request, threading
 
-ROOT = sys.argv[1]
-DATA = sys.argv[2]
+ROOT = os.path.abspath(sys.argv[1])
+DATA = os.path.abspath(sys.argv[2])
 PORT = int(sys.argv[3]) if len(sys.argv) > 3 else 8090
+BIND = sys.argv[4] if len(sys.argv) > 4 else '127.0.0.1'
+OBJ = re.compile(r'^[0-9a-f]{2}/[0-9a-f]{40}$')
 lock = threading.Lock()
+
+
+def safe(base, rel):
+    rel = posixpath.normpath('/' + rel).lstrip('/')
+    p = os.path.normpath(os.path.join(base, *rel.split('/'))) if rel else base
+    return p if p == base or p.startswith(base + os.sep) else None
+
 
 class H(http.server.SimpleHTTPRequestHandler):
     def end_headers(self):
@@ -14,21 +23,31 @@ class H(http.server.SimpleHTTPRequestHandler):
         super().end_headers()
 
     def translate_path(self, path):
-        path = path.split('?')[0]
+        path = urllib.parse.unquote(path.split('?', 1)[0].split('#', 1)[0])
         if path.startswith('/data/'):
-            p = os.path.join(DATA, path[6:])
-            if path.startswith('/data/assets/objects/') and not os.path.exists(p):
-                h = os.path.basename(p)
-                with lock:
-                    if not os.path.exists(p):
-                        os.makedirs(os.path.dirname(p), exist_ok=True)
-                        urllib.request.urlretrieve('https://resources.download.minecraft.net/' + h[:2] + '/' + h, p + '.tmp')
-                        os.replace(p + '.tmp', p)
-            return p
-        return os.path.join(ROOT, path.lstrip('/'))
+            rel = path[6:]
+            if rel.startswith('assets/objects/'):
+                h = rel[len('assets/objects/'):]
+                if not OBJ.match(h):
+                    return ''
+                p = os.path.join(DATA, 'assets', 'objects', *h.split('/'))
+                if not os.path.exists(p):
+                    with lock:
+                        if not os.path.exists(p):
+                            os.makedirs(os.path.dirname(p), exist_ok=True)
+                            try:
+                                urllib.request.urlretrieve('https://resources.download.minecraft.net/' + h, p + '.tmp')
+                                os.replace(p + '.tmp', p)
+                            except Exception:
+                                try: os.remove(p + '.tmp')
+                                except OSError: pass
+                return p
+            return safe(DATA, rel) or ''
+        return safe(ROOT, path) or ''
 
     def log_message(self, *a):
         pass
 
+
 H.extensions_map.update({'.wasm': 'application/wasm', '.js': 'text/javascript', '.mjs': 'text/javascript'})
-http.server.ThreadingHTTPServer(('0.0.0.0', PORT), H).serve_forever()
+http.server.ThreadingHTTPServer((BIND, PORT), H).serve_forever()
