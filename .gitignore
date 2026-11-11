@@ -27,3 +27,4 @@ ba.sh
 __pycache__/
 scripts/e2e/e2e-out/
 srv/.env
+srv/state-dev/
