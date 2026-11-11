@@ -259,6 +259,8 @@ const server = http.createServer(async (req, res) => {
     }
     if (u.pathname === '/') { res.writeHead(302, { Location: '/launcher/' }); return res.end(); }
     const p = safe(ROOT, u.pathname);
+    // mc.wasm is Mojang's code compiled to wasm: only hand it to logged-in players, never publicly.
+    if (p && path.basename(p) === 'mc.wasm' && !s) return json(res, 401, { error: 'login' });
     return p ? await file(req, res, p) : json(res, 400, {});
   } catch (e) {
     console.error(e);
