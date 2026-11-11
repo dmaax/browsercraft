@@ -267,20 +267,62 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+// The bridge must not become a door into the server's own network: targets that resolve to
+// loopback, private, link-local, CGNAT, multicast or reserved ranges are refused unless
+// MC_ALLOW_PRIVATE=1 (e.g. for testing against a Minecraft server on the same LAN).
+const ALLOW_PRIVATE = process.env.MC_ALLOW_PRIVATE === '1';
+const ORIGINS = new Set((process.env.BC_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean));
+const blocked = new net.BlockList();
+for (const [a, p] of [['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16], ['172.16.0.0', 12], ['192.0.0.0', 24], ['192.0.2.0', 24],
+  ['192.88.99.0', 24], ['192.168.0.0', 16], ['198.18.0.0', 15], ['198.51.100.0', 24], ['203.0.113.0', 24], ['224.0.0.0', 4], ['240.0.0.0', 4]]) blocked.addSubnet(a, p, 'ipv4');
+for (const [a, p] of [['::', 128], ['::1', 128], ['64:ff9b::', 96], ['64:ff9b:1::', 48], ['100::', 64], ['2001:db8::', 32], ['2002::', 16], ['fc00::', 7], ['fe80::', 10], ['fec0::', 10], ['ff00::', 8]]) blocked.addSubnet(a, p, 'ipv6');
+const HOST_RE = /^[a-z0-9.-]{1,253}$/;
+
+function sameOrigin(req) {
+  const o = req.headers.origin;
+  if (!o) return true; // browsers always send Origin on WebSocket handshakes; cookie-less tools can't use a session anyway
+  try { const h = new URL(o).host; return h === req.headers.host || ORIGINS.has(o); } catch { return false; }
+}
+
+async function target(host, port) {
+  if (!HOST_RE.test(host)) return null;
+  if (port === 25565) {
+    try {
+      const r = await dns.resolveSrv('_minecraft._tcp.' + host);
+      if (r.length) { host = r[0].name.toLowerCase().replace(/\.$/, ''); port = r[0].port; }
+    } catch {}
+    if (!HOST_RE.test(host)) return null;
+  }
+  if (!Number.isInteger(port) || port < PORTS[0] || port > (PORTS[1] || PORTS[0])) return null;
+  let addrs;
+  try { addrs = await dns.lookup(host, { all: true }); } catch { return null; }
+  if (!addrs.length) return null;
+  if (!ALLOW_PRIVATE && addrs.some(a => blocked.check(a.address, a.family === 6 ? 'ipv6' : 'ipv4'))) return null;
+  return { host, port, addrs };
+}
+
 const wss = new WebSocketServer({ noServer: true, maxPayload: 8 << 20 });
 server.on('upgrade', async (req, sock, head) => {
-  const u = new URL(req.url, 'http://x');
-  const s = session(req);
-  if (u.pathname !== '/ws' || !s) { sock.destroy(); return; }
-  let host = String(u.searchParams.get('h') || '').toLowerCase();
-  let port = +u.searchParams.get('p') || 25565;
-  if (!/^[a-z0-9.-]{1,253}$/.test(host)) { sock.destroy(); return; }
-  if (port === 25565) {
-    try { const r = await dns.resolveSrv('_minecraft._tcp.' + host); if (r.length) { host = r[0].name; port = r[0].port; } } catch {}
+  sock.on('error', () => {});
+  try {
+    const u = new URL(req.url, 'http://x');
+    const s = session(req);
+    if (u.pathname !== '/ws' || !s || !sameOrigin(req)) { sock.destroy(); return; }
+    const tg = await target(String(u.searchParams.get('h') || '').toLowerCase(), +u.searchParams.get('p') || 25565);
+    if (!tg) { sock.destroy(); return; }
+    bridge(req, sock, head, tg);
+  } catch (e) {
+    console.error(e);
+    sock.destroy();
   }
-  if (port < PORTS[0] || port > (PORTS[1] || PORTS[0])) { sock.destroy(); return; }
+});
+
+function bridge(req, sock, head, { host, port, addrs }) {
   wss.handleUpgrade(req, sock, head, (ws) => {
-    const t = net.connect({ host, port });
+    // Hand net.connect the addresses that were checked instead of letting it resolve the name
+    // again (a second DNS answer could point somewhere else); it still tries each in turn.
+    const lookup = (_h, o, cb) => (o && o.all ? cb(null, addrs) : cb(null, addrs[0].address, addrs[0].family));
+    const t = net.connect({ host, port, lookup });
     t.setNoDelay(true);
     let open = false;
     const q = [];
@@ -293,6 +335,6 @@ server.on('upgrade', async (req, sock, head) => {
     ws.on('close', end);
     ws.on('error', end);
   });
-});
+}
 
 server.listen(PORT, () => console.log('browsercraft on :' + PORT));
