@@ -1,7 +1,10 @@
 """Minimal Minecraft protocol probe: status ping + offline-mode login.
 
 usage: mcping.py HOST PORT [NAME]
-       mcping.py --ws ws://HOST:PORT/ws MCHOST MCPORT [NAME]   (through the browsercraft bridge)
+       mcping.py --ws ws[s]://HOST[:PORT]/ws MCHOST MCPORT [NAME]   (through the browsercraft bridge)
+
+env for --ws: BC_COOKIE='bc=<session>' when the bridge needs a session (no BC_DEV),
+              WS_CONNECT=IP:PORT to dial another address but keep Host/SNI (like curl --resolve).
 """
 import json, socket, struct, sys, uuid, zlib, base64, os
 
@@ -42,15 +45,23 @@ class Raw:
 class Ws(Raw):
     """Just enough of RFC 6455 (client side, binary frames) to talk through the bridge."""
 
-    def __init__(self, url, cookie=None):
-        assert url.startswith('ws://')
-        hp, path = url[5:].split('/', 1)
-        h, p = hp.split(':')
-        self.s = socket.create_connection((h, int(p)), timeout=10)
+    def __init__(self, url, cookie=None, connect=None):
+        tls = url.startswith('wss://')
+        assert tls or url.startswith('ws://')
+        hp, path = url.split('://', 1)[1].split('/', 1)
+        h, p = (hp.split(':') + [None])[:2]
+        p = int(p or (443 if tls else 80))
+        # connect=HOST:PORT dials somewhere else but keeps Host/SNI (like curl --resolve).
+        ch, cp = (connect.split(':')[0], int(connect.split(':')[1])) if connect else (h, p)
+        self.s = socket.create_connection((ch, cp), timeout=10)
+        if tls:
+            import ssl
+            self.s = ssl.create_default_context().wrap_socket(self.s, server_hostname=h)
         self.buf = b''
         self.inbuf = b''
         key = base64.b64encode(os.urandom(16)).decode()
-        req = f'GET /{path} HTTP/1.1\r\nHost: {hp}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\nOrigin: http://{hp}\r\n'
+        origin = ('https://' if tls else 'http://') + hp
+        req = f'GET /{path} HTTP/1.1\r\nHost: {hp}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\nOrigin: {origin}\r\n'
         if cookie:
             req += f'Cookie: {cookie}\r\n'
         self.s.sendall((req + '\r\n').encode())
@@ -153,7 +164,7 @@ def main():
     if a[0] == '--ws':
         url, host, port = a[1], a[2], int(a[3])
         rest = a[4:]
-        mk = lambda: Ws(f'{url}?h={host}&p={port}')
+        mk = lambda: Ws(f'{url}?h={host}&p={port}', os.environ.get('BC_COOKIE'), os.environ.get('WS_CONNECT'))
     else:
         host, port = a[0], int(a[1])
         rest = a[2:]

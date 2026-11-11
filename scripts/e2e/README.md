@@ -17,6 +17,8 @@ BC_DEV=1 MC_ALLOW_PRIVATE=1 BC_ROOT=$PWD/../../web BC_DATA=$PWD/../../data PORT=
 ```
 
 `MC_ALLOW_PRIVATE=1` is only needed when the Minecraft server is on a private address.
+Without `BC_DEV` the bridge needs a session cookie (`BC_COOKIE`); `WS_CONNECT=IP:PORT` dials another
+address while keeping Host/SNI, like `curl --resolve`, to test a proxy before its DNS record exists.
 The server must run the same version as the client (26.3), with `online-mode=false`.
 
 ## Run
@@ -24,6 +26,7 @@ The server must run the same version as the client (26.3), with `online-mode=fal
 ```sh
 python3 mcping.py 10.0.0.5 25565                               # direct
 python3 mcping.py --ws ws://localhost:8090/ws 10.0.0.5 25565   # through the bridge
+BC_COOKIE='bc=<session>' python3 mcping.py --ws wss://mc.example.org/ws 10.0.0.5 25565   # through an HTTPS reverse proxy, with a session
 npm run gpucheck                                                # expect "OK ... device alive"
 MC_SERVER=10.0.0.5:25565 node join.mjs                          # expect "PASS"
 ```
