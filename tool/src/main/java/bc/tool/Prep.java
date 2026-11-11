@@ -86,6 +86,8 @@ public class Prep {
         Gsg.gen(nodes, dirty);
         clinits();
         System.out.println("vh calls " + nvh + " unresolved " + nbad + " redirects " + nrd + " dirty " + dirty.size());
+        System.out.println("types erased to Object " + erased.size() + (erased.isEmpty() ? "" : " " + erased));
+        System.out.println("JDK types resolved via TeaVM " + viaTeavm.size() + (viaTeavm.isEmpty() ? "" : " " + viaTeavm));
         try (var jo = new JarOutputStream(Files.newOutputStream(out))) {
             for (var n : dirty) {
                 var cn = nodes.get(n);
@@ -103,7 +105,24 @@ public class Prep {
     static String sg;
     static int sp;
 
-    static boolean known(String n) { return nodes.containsKey(n) || n.startsWith("java/lang/") || n.startsWith("java/util/"); }
+    static boolean known(String n) { return nodes.containsKey(n) || n.startsWith("java/lang/") || n.startsWith("java/util/") || teavm(n); }
+
+    static final Map<String, Boolean> tv = new HashMap<>();
+    static final Set<String> erased = new TreeSet<>(), viaTeavm = new TreeSet<>();
+
+    // A JDK class TeaVM can compile: either one of our own patches (rt/cls, built by run.sh before Prep)
+    // or a classlib class, which TeaVM keeps as org/teavm/classlib/<pkg>/T<Name> (e.g. java/nio/ByteBuffer).
+    // Without this, such types were erased to Object in generated Gson metadata, so Gson picked the wrong
+    // adapter: MinecraftServicesKeyInfo$KeyData(ByteBuffer) got a String and trapped with "illegal cast".
+    static boolean teavm(String n) {
+        return tv.computeIfAbsent(n, k -> {
+            if (!sys(k) && !k.startsWith("javax/")) return false;
+            if (Files.exists(Path.of("rt/cls", k + ".class"))) return true;
+            int i = k.lastIndexOf('/');
+            var t = "org/teavm/classlib/" + k.substring(0, i + 1) + "T" + k.substring(i + 1);
+            return Files.exists(Path.of("rt/cls", t + ".class")) || Prep.class.getClassLoader().getResource(t + ".class") != null;
+        });
+    }
 
     static boolean sys(String n) { return n.startsWith("java/") || n.startsWith("jdk/") || n.startsWith("sun/"); }
 
@@ -198,6 +217,8 @@ public class Prep {
     }
 
     static void ldcCls(InsnList il, String n) {
+        if (!known(n)) erased.add(n);
+        else if (!nodes.containsKey(n) && !n.startsWith("java/lang/") && !n.startsWith("java/util/")) viaTeavm.add(n);
         il.add(new LdcInsnNode(Type.getObjectType(known(n) ? n : "java/lang/Object")));
     }
 
