@@ -16,6 +16,7 @@ const NAME = process.env.MC_NAME || 'BcE2E';
 const SECS = +(process.env.SECS || 240);
 const OUT = path.resolve(process.env.OUT || 'e2e-out');
 const CHROME = process.env.CHROME || '/usr/bin/google-chrome';
+const F2_AFTER = +(process.env.F2_AFTER || 60); // seconds after connecting before the in-game screenshot
 fs.mkdirSync(OUT, { recursive: true });
 
 const T0 = Date.now();
@@ -96,7 +97,7 @@ while (Date.now() < end) {
   }
   log('probe ' + JSON.stringify(s) + (connectedAt ? ` progressing=${framesAfter}` : ''));
   // F2 = the game's own screenshot (read back from WebGPU); page screenshots do not capture the worker's canvas.
-  if (!shot && connectedAt && Date.now() - connectedAt > 60000) { shot = true; await p.focus('canvas').catch(() => {}); await p.keyboard.press('F2'); log('F2 -> ' + OUT); }
+  if (!shot && connectedAt && Date.now() - connectedAt > F2_AFTER * 1000) { shot = true; await p.focus('canvas').catch(() => {}); await p.keyboard.press('F2'); log('F2 -> ' + OUT); }
 }
 await new Promise(r => setTimeout(r, 3000));
 await b.close();

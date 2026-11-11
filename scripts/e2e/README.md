@@ -32,7 +32,8 @@ MC_SERVER=10.0.0.5:25565 node join.mjs                          # expect "PASS"
 ```
 
 `join.mjs` takes `BC_ORIGIN` (default `http://localhost:8090`), `MC_SERVER`, `MC_NAME`, `SECS`
-(default 240), `OUT` (log and screenshot, default `./e2e-out`) and `CHROME`. It passes when the
+(default 240), `OUT` (log and screenshot, default `./e2e-out`), `F2_AFTER` (seconds after connecting
+before the screenshot, default 60) and `CHROME`. It passes when the
 client connects and keeps presenting frames afterwards; the server log should also show
 `<name> joined the game`.
 
