@@ -197,8 +197,7 @@ export const gpu = {
       const m = u8();
       for (let r = 0; r < h; r++) m.set(src.subarray(r * al, r * al + row), dst + r * row);
       st.unmap();
-      st.destroy();
-    }).catch(e => console.error('[gpu] readTex', e));
+    }).catch(e => console.error('[gpu] readTex', e)).finally(() => st.destroy());
     gpu.chain = Promise.all([gpu.chain, p]).then(() => { gpu.doneMax = Math.max(gpu.doneMax, k); });
     return k;
   },
@@ -230,7 +229,7 @@ export const gpu = {
       return 0;
     }
   },
-  pipeDel(i) { del(i); },
+  pipeDel(i) { del(i); bgCache.clear(); },
   setPipe(i) { pass.setPipeline(H[i].p); },
   setVB(slot, b, off) { pass.setVertexBuffer(slot, H[b], off); },
   setIB(b, fmt, off) { pass.setIndexBuffer(H[b], fmt ? 'uint32' : 'uint16', off); },
@@ -296,7 +295,7 @@ export const gpu = {
   pending: 0,
   fence() {
     const k = ++gpu.ticket;
-    const p = q.onSubmittedWorkDone();
+    const p = q.onSubmittedWorkDone().catch(e => console.error('[gpu] fence', e));
     gpu.chain = Promise.all([gpu.chain, p]).then(() => { gpu.doneMax = Math.max(gpu.doneMax, k); });
     return k;
   },
@@ -309,8 +308,7 @@ export const gpu = {
     const p = st.mapAsync(GPUMapMode.READ).then(() => {
       u8().set(new Uint8Array(st.getMappedRange(0, (len + 3) & ~3)).subarray(0, len), dst);
       st.unmap();
-      st.destroy();
-    });
+    }).catch(e => console.error('[gpu] readBack', e)).finally(() => st.destroy());
     gpu.chain = Promise.all([gpu.chain, p]).then(() => { gpu.doneMax = Math.max(gpu.doneMax, k); });
     return k;
   },
