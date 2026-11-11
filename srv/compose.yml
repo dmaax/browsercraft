@@ -1,14 +1,25 @@
+# Run from srv/: `docker compose up -d`. Paths are relative to this file, so the
+# front-end and game data come from the repository root (../web, ../data).
+#
+# The game needs a secure context (WebGPU, OPFS, SharedArrayBuffer) and the session
+# cookie is Secure, so serve it over HTTPS through a reverse proxy. The port is bound
+# to 127.0.0.1 for that reason; set BC_BIND=0.0.0.0 only if the proxy runs elsewhere.
+#
+# BAKE_CMD runs inside this container (node:alpine: no Java, Docker or ssh). It has to
+# be a command that works from here and leaves the result in /state/builds/$BC_INSTANCE/.
 services:
   browsercraft:
     build: .
     restart: unless-stopped
     ports:
-      - "8090:8090"
+      - "${BC_BIND:-127.0.0.1}:8090:8090"
     environment:
       MS_CLIENT_ID: ${MS_CLIENT_ID:-}
       ADMIN_UUIDS: ${ADMIN_UUIDS:-}
       BAKE_CMD: ${BAKE_CMD:-}
+      BC_ORIGINS: ${BC_ORIGINS:-}
+      MC_ALLOW_PRIVATE: ${MC_ALLOW_PRIVATE:-}
     volumes:
-      - ./web:/app/web:ro
-      - ./data:/data
+      - ../web:/app/web:ro
+      - ../data:/data
       - ./state:/state
