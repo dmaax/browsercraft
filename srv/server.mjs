@@ -239,7 +239,18 @@ async function objects(req, res, rel) {
   return file(req, res, p);
 }
 
+// BC_ACCESS_LOG=1 logs every request and every bridge connection (paths only: no query strings,
+// cookies or headers, so no tokens end up in the log).
+const ACCESS = process.env.BC_ACCESS_LOG === '1';
+const alog = (...a) => { if (ACCESS) console.log(new Date().toISOString(), ...a); };
+
 const server = http.createServer(async (req, res) => {
+  if (ACCESS) {
+    const t0 = Date.now(), pth = new URL(req.url, 'http://x').pathname, who = session(req) ? 'session' : 'anon';
+    let done = false;
+    res.on('finish', () => { done = true; alog(req.method, pth, res.statusCode, res.getHeader('content-length') ?? '-', (Date.now() - t0) + 'ms', who); });
+    res.on('close', () => { if (!done) alog(req.method, pth, 'ABORTED', (Date.now() - t0) + 'ms', who); });
+  }
   try {
     const u = new URL(req.url, 'http://x');
     const s = session(req);
@@ -309,9 +320,12 @@ server.on('upgrade', async (req, sock, head) => {
   try {
     const u = new URL(req.url, 'http://x');
     const s = session(req);
-    if (u.pathname !== '/ws' || !s || !sameOrigin(req)) { sock.destroy(); return; }
-    const tg = await target(String(u.searchParams.get('h') || '').toLowerCase(), +u.searchParams.get('p') || 25565);
-    if (!tg) { sock.destroy(); return; }
+    const why = u.pathname !== '/ws' ? 'not /ws' : !s ? 'no session' : !sameOrigin(req) ? 'origin ' + req.headers.origin : '';
+    if (why) { alog('WS refused:', why); sock.destroy(); return; }
+    const h = String(u.searchParams.get('h') || '').toLowerCase(), p = +u.searchParams.get('p') || 25565;
+    const tg = await target(h, p);
+    if (!tg) { alog(`WS refused: target ${h}:${p} (bad name, port outside MC_PORTS, unresolvable or private)`); sock.destroy(); return; }
+    alog(`WS open -> ${h}:${p}` + (tg.host !== h || tg.port !== p ? ` (SRV ${tg.host}:${tg.port})` : ''));
     bridge(req, sock, head, tg);
   } catch (e) {
     console.error(e);
@@ -326,13 +340,16 @@ function bridge(req, sock, head, { host, port, addrs }) {
     const lookup = (_h, o, cb) => (o && o.all ? cb(null, addrs) : cb(null, addrs[0].address, addrs[0].family));
     const t = net.connect({ host, port, lookup });
     t.setNoDelay(true);
-    let open = false;
-    const q = [];
-    t.on('connect', () => { open = true; for (const b of q) t.write(b); q.length = 0; });
-    ws.on('message', (d) => { if (open) t.write(d); else q.push(d); });
-    t.on('data', (d) => { if (ws.readyState === 1) ws.send(d); });
-    const end = () => { try { ws.close(); } catch {} t.destroy(); };
-    t.on('error', end);
+    let open = false, up = 0, down = 0, closed = false;
+    const t0 = Date.now(), q = [];
+    t.on('connect', () => { open = true; alog(`WS tcp connected ${host}:${port}`); for (const b of q) t.write(b); q.length = 0; });
+    ws.on('message', (d) => { up += d.length; if (open) t.write(d); else q.push(d); });
+    t.on('data', (d) => { down += d.length; if (ws.readyState === 1) ws.send(d); });
+    const end = () => {
+      if (!closed) { closed = true; alog(`WS closed ${host}:${port} after ${((Date.now() - t0) / 1000).toFixed(1)}s, client->server ${up} B, server->client ${down} B`); }
+      try { ws.close(); } catch {} t.destroy();
+    };
+    t.on('error', (e) => { alog(`WS tcp error ${host}:${port}: ${e.code || e.message}`); end(); });
     t.on('close', end);
     ws.on('close', end);
     ws.on('error', end);
